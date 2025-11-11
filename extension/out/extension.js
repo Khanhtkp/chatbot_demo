@@ -4,9 +4,11 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = require("vscode");
 const node_fetch_1 = require("node-fetch");
+// Store last indexed time per workspace to avoid unnecessary re-indexing
+const lastIndexed = {};
 function activate(context) {
     // File watcher to notify backend about new files
-    const watcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,js,py,java,cpp,cs,txt, ipynb}');
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,js,py,java,cpp,cs,txt,ipynb}');
     watcher.onDidCreate(async (uri) => {
         console.log('🟢 New file detected:', uri.fsPath);
         try {
@@ -19,12 +21,15 @@ function activate(context) {
                 body: JSON.stringify({ parent_root: workspaceFolder.uri.fsPath }),
             });
             console.log('✅ Backend indexed new file');
+            // Update last indexed time
+            lastIndexed[workspaceFolder.uri.fsPath] = Date.now();
         }
         catch (err) {
             console.error('❌ Indexing failed:', err);
         }
     });
     context.subscriptions.push(watcher);
+    // Command to open CodeRAG Chat webview
     const disposable = vscode.commands.registerCommand('coderag.chat', async () => {
         const panel = vscode.window.createWebviewPanel('coderagChat', 'CodeRAG Chat', vscode.ViewColumn.Beside, { enableScripts: true });
         panel.webview.html = getWebviewContent();
@@ -54,12 +59,20 @@ function activate(context) {
             }
             console.log('🟡 Sending to backend:', { question: msg.question, parent });
             try {
-                // Auto-index parent folder before sending the question
-                await (0, node_fetch_1.default)('http://127.0.0.1:8000/index', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ parent_root: parent }),
-                });
+                const now = Date.now();
+                const last = lastIndexed[parent] || 0;
+                // Only re-index if more than 60 seconds passed
+                if (now - last > 60000) {
+                    panel.webview.postMessage({ id: msg.id, status: 'indexing' });
+                    await (0, node_fetch_1.default)('http://127.0.0.1:8000/index', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ parent_root: parent }),
+                    });
+                    lastIndexed[parent] = now;
+                }
+                // Tell webview we are now thinking
+                panel.webview.postMessage({ id: msg.id, status: 'thinking' });
                 const res = await (0, node_fetch_1.default)('http://127.0.0.1:8000/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -80,9 +93,9 @@ function activate(context) {
     context.subscriptions.push(disposable);
 }
 function deactivate() { }
-/**
- * HTML + JS for CodeRAG Chat
- */
+// --------------------
+// HTML + JS for CodeRAG Chat Webview
+// --------------------
 function getWebviewContent() {
     return /*html*/ `
   <!DOCTYPE html>
@@ -91,85 +104,18 @@ function getWebviewContent() {
     <meta charset="UTF-8">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
-      body {
-        font-family: "Segoe UI", sans-serif;
-        padding: 15px;
-        background-color: #1e1e1e;
-        color: #d4d4d4;
-      }
-      textarea {
-        width: 100%;
-        height: 80px;
-        resize: vertical;
-        font-family: monospace;
-        border-radius: 8px;
-        border: 1px solid #3c3c3c;
-        background: #252526;
-        color: #fff;
-        padding: 8px;
-        box-sizing: border-box;
-      }
-      button {
-        margin-top: 10px;
-        padding: 8px 14px;
-        border: none;
-        border-radius: 5px;
-        background-color: #007acc;
-        color: white;
-        cursor: pointer;
-      }
-      button:hover {
-        background-color: #005fa3;
-      }
-      #ans {
-        background: #252526;
-        padding: 12px;
-        border-radius: 6px;
-        margin-top: 16px;
-        font-size: 14px;
-        line-height: 1.5;
-        max-height: 65vh;
-        overflow-y: auto;
-      }
-      .message {
-        margin-bottom: 16px;
-        padding-bottom: 8px;
-        border-bottom: 1px solid #3c3c3c;
-      }
-      .user {
-        color: #9cdcfe;
-        margin-bottom: 6px;
-      }
-      .assistant {
-        border-left: 3px solid #007acc;
-        padding-left: 10px;
-        margin-top: 6px;
-      }
-      pre code {
-        display: block;
-        padding: 10px;
-        background: #1e1e1e;
-        border-radius: 8px;
-        overflow-x: auto;
-      }
-      code {
-        background: #333;
-        color: #dcdcaa;
-        padding: 3px 6px;
-        border-radius: 4px;
-      }
-      .cursor {
-        display: inline-block;
-        width: 6px;
-        background: #007acc;
-        animation: blink 1s steps(1) infinite;
-      }
-      @keyframes blink {
-        50% { background: transparent; }
-      }
+      body { font-family: "Segoe UI", sans-serif; padding: 15px; background-color: #1e1e1e; color: #d4d4d4; }
+      textarea { width: 100%; height: 80px; resize: vertical; font-family: monospace; border-radius: 8px; border: 1px solid #3c3c3c; background: #252526; color: #fff; padding: 8px; box-sizing: border-box; }
+      button { margin-top: 10px; padding: 8px 14px; border: none; border-radius: 5px; background-color: #007acc; color: white; cursor: pointer; }
+      button:hover { background-color: #005fa3; }
+      #ans { background: #252526; padding: 12px; border-radius: 6px; margin-top: 16px; font-size: 14px; line-height: 1.5; max-height: 65vh; overflow-y: auto; }
+      .message { margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid #3c3c3c; }
+      .user { color: #9cdcfe; margin-bottom: 6px; }
+      .assistant { border-left: 3px solid #007acc; padding-left: 10px; margin-top: 6px; }
+      pre code { display: block; padding: 10px; background: #1e1e1e; border-radius: 8px; overflow-x: auto; }
+      code { background: #333; color: #dcdcaa; padding: 3px 6px; border-radius: 4px; }
     </style>
   </head>
-
   <body>
     <h2>💬 CodeRAG Chat</h2>
     <textarea id="q" placeholder="Ask something about your code..."></textarea>
@@ -191,12 +137,24 @@ function getWebviewContent() {
       });
 
       window.addEventListener('message', event => {
-        const { id, answer } = event.data;
+        const { id, answer, status } = event.data;
         const replyDiv = document.querySelector(\`#reply-\${id}\`);
         if (!replyDiv) return;
 
-        replyDiv.innerHTML = "";
-        typeWriterEffect(marked.parse(answer), replyDiv);
+        if (status === 'indexing') {
+          replyDiv.innerHTML = '<em>Indexing new files...</em>';
+          return;
+        }
+
+        if (status === 'thinking') {
+          replyDiv.innerHTML = '<em>Thinking...</em>';
+          return;
+        }
+
+        if (answer) {
+          replyDiv.innerHTML = '';
+          typeWriterEffect(marked.parse(answer), replyDiv);
+        }
       });
 
       function appendMessage(question, id) {
@@ -216,7 +174,6 @@ function getWebviewContent() {
         const text = tempDiv.innerText;
         container.innerHTML = "";
         let i = 0;
-
         function type() {
           if (i < text.length) {
             container.textContent += text.charAt(i);

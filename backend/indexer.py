@@ -2,40 +2,37 @@ import os
 import json
 import hashlib
 import time
+import logging
 from pathlib import Path
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
+import ast
+import torch
+from transformers import AutoTokenizer, AutoModel
 from rank_bm25 import BM25Okapi
-import logging
-
+import re
 # ================================
 # Configuration
 # ================================
 INDEX_DIR = "storage"
-TEXT_EXTENSIONS = {".py", ".js", ".ts", ".java", ".cpp", ".cs", ".txt", ".md", ".ipynb"}
+TEXT_EXTENSIONS = {".py", ".js", ".ts", ".java", ".cpp", ".cs", ".txt", ".md"}
+MODEL_NAME = "jinaai/jina-embeddings-v2-base-code"  # Code-aware embedding model
 
-# ✅ Use a lighter model for speed (same E5 family)
-# Replace with "intfloat/e5-mistral-7b-instruct" if you want maximum quality
-model = SentenceTransformer("intfloat/e5-mistral-7b-instruct", device="cuda")
+# Load Jina model properly (no partial weights issue)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True).to("cuda").eval()
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ================================
 # Utilities
 # ================================
 def hash_text(text: str):
-    """Fast SHA256 hash for change detection."""
+    """SHA256 hash for incremental change detection."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def load_json(path, default=None):
-    """Load JSON safely."""
     if os.path.exists(path):
         with open(path, "r") as f:
             return json.load(f)
@@ -43,13 +40,73 @@ def load_json(path, default=None):
 
 
 def save_json(obj, path):
-    """Save JSON with nice formatting."""
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
 
+def tokenize_code(text):
+    return re.findall(r"\w+", text)
+# ================================
+# Embedding Function
+# ================================
+def encode_texts(texts, batch_size=16):
+    """Encode texts using Jina embedding model."""
+    all_embeddings = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        inputs = tokenizer(batch, padding=True, truncation=True, return_tensors="pt").to("cuda")
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Jina models output pooled embeddings directly
+            if hasattr(outputs, "pooler_output"):
+                emb = outputs.pooler_output
+            elif isinstance(outputs, torch.Tensor):
+                emb = outputs
+            else:
+                emb = outputs[0]
+
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            all_embeddings.append(emb.cpu().numpy().astype("float32"))
+
+    return np.vstack(all_embeddings)
+
 
 # ================================
-# Indexing Function
+# Code Chunking (AST-based)
+# ================================
+def extract_code_chunks(path):
+    """Extracts functions, classes, and top-level code blocks from a Python file."""
+    text = Path(path).read_text(errors="ignore")
+    ext = Path(path).suffix.lower()
+
+    if ext != ".py":
+        return [{"type": "file", "name": Path(path).name, "code": text[:3000]}]
+
+    try:
+        tree = ast.parse(text)
+        chunks = []
+        lines = text.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = node.lineno - 1
+                end = getattr(node, "end_lineno", start + 1)
+                snippet = "\n".join(lines[start:end])
+                chunks.append({
+                    "type": node.__class__.__name__,
+                    "name": getattr(node, "name", ""),
+                    "code": snippet
+                })
+        if not chunks:
+            chunks = [{"type": "file", "name": Path(path).name, "code": text[:3000]}]
+        return chunks
+    except Exception as e:
+        logging.warning(f"AST parse failed for {path}: {e}")
+        return [{"type": "file", "name": Path(path).name, "code": text[:3000]}]
+
+
+# ================================
+# Indexing
 # ================================
 def ensure_index(root_dir: str):
     os.makedirs(INDEX_DIR, exist_ok=True)
@@ -57,105 +114,109 @@ def ensure_index(root_dir: str):
     docs_json_path = f"{INDEX_DIR}/docs.json"
     emb_cache_path = f"{INDEX_DIR}/embeddings.npy"
 
-    logging.info(f"📂 Indexing folder (incremental): {root_dir}")
-
     existing_docs = load_json(docs_json_path, [])
-    existing_docs_dict = {str(Path(d['path']).resolve()): d for d in existing_docs}
+    existing_docs_dict = {d["uid"]: d for d in existing_docs}
 
-    # --------------------------
-    # Step 1: Detect new/updated files
-    # --------------------------
-    new_or_updated_docs = []
+    new_docs = []
+
+    logging.info(f"📦 Scanning directory: {root_dir}")
     for p in Path(root_dir).rglob("*.*"):
         if not (p.is_file() and p.suffix.lower() in TEXT_EXTENSIONS):
             continue
         if any(x in str(p) for x in [".git", "__pycache__"]):
             continue
 
-        p_resolved = str(p.resolve())
-        try:
-            txt = p.read_text(errors="ignore").strip()
-            if not txt:
+        chunks = extract_code_chunks(p)
+        for c in chunks:
+            snippet = c["code"].strip()
+            if not snippet:
                 continue
+            snippet_hash = hash_text(snippet[:3000])
+            uid = f"{p.resolve()}::{c['name']}"
+            old_hash = existing_docs_dict.get(uid, {}).get("hash")
 
-            txt_hash = hash_text(txt[:3000])
-            old_hash = existing_docs_dict.get(p_resolved, {}).get("hash")
-
-            if old_hash != txt_hash:
-                new_or_updated_docs.append({
-                    "path": p_resolved,
-                    "text": txt[:3000],
-                    "hash": txt_hash
+            if old_hash != snippet_hash:
+                new_docs.append({
+                    "uid": uid,
+                    "path": str(p.resolve()),
+                    "name": c["name"],
+                    "type": c["type"],
+                    "text": snippet[:3000],
+                    "hash": snippet_hash
                 })
-                logging.info(f"   ➕ Updated file: {p_resolved}")
+                logging.info(f"   ➕ Updated: {uid}")
 
-        except Exception as e:
-            logging.warning(f"   ⚠️ Could not read {p_resolved}: {e}")
-
-    if not new_or_updated_docs:
-        logging.info("✅ No new or updated documents detected")
+    if not new_docs:
+        logging.info("✅ No new or updated code chunks found.")
         return
 
-    # --------------------------
-    # Step 2: Merge & update metadata
-    # --------------------------
-    for doc in new_or_updated_docs:
-        existing_docs_dict[doc['path']] = doc
+    # Merge metadata
+    for d in new_docs:
+        existing_docs_dict[d["uid"]] = d
     all_docs = list(existing_docs_dict.values())
     save_json(all_docs, docs_json_path)
 
-    # --------------------------
-    # Step 3: Embed new docs only
-    # --------------------------
+    # Embed new docs only
+    texts = [d["text"] for d in new_docs]
     t0 = time.time()
-    new_texts = [d["text"] for d in new_or_updated_docs]
-    new_emb = model.encode(
-        new_texts,
-        batch_size=16,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=True
-    ).astype('float32')
-    logging.info(f"🧠 Encoded {len(new_texts)} new/updated docs in {time.time()-t0:.2f}s")
+    new_emb = encode_texts(texts)
+    logging.info(f"🧠 Embedded {len(texts)} new chunks in {time.time() - t0:.2f}s")
 
-    # --------------------------
-    # Step 4: Incrementally update FAISS
-    # --------------------------
+    # Update FAISS index
     if os.path.exists(index_path) and os.path.exists(emb_cache_path):
         index = faiss.read_index(index_path)
         old_emb = np.load(emb_cache_path)
-        new_all_emb = np.concatenate([old_emb, new_emb], axis=0)
+        all_emb = np.concatenate([old_emb, new_emb], axis=0)
     else:
-        dim = new_emb.shape[1]
-        index = faiss.IndexFlatIP(dim)
-        new_all_emb = new_emb
+        index = faiss.IndexFlatIP(new_emb.shape[1])
+        all_emb = new_emb
 
     index.add(new_emb)
-    np.save(emb_cache_path, new_all_emb)
+    np.save(emb_cache_path, all_emb)
     faiss.write_index(index, index_path)
-    logging.info(f"✅ FAISS index updated with {len(new_all_emb)} total embeddings")
+    logging.info(f"✅ FAISS index updated ({len(all_emb)} vectors).")
 
-    # --------------------------
-    # Step 5: Rebuild BM25 (lightweight)
-    # --------------------------
+    # Build BM25
     tokenized = [d["text"].split() for d in all_docs]
+    tokenized = [tokenize_code(d["text"]) for d in all_docs]
     bm25 = BM25Okapi(tokenized)
-    bm25_cache_path = f"{INDEX_DIR}/bm25.json"
-    save_json({"docs": all_docs}, bm25_cache_path)
-    logging.info("✅ BM25 index updated")
+    save_json({"docs": all_docs}, f"{INDEX_DIR}/bm25.json")
+    logging.info("✅ BM25 index refreshed.")
 
 
 # ================================
-# Retrieval Function
+# Retrieval (Hybrid)
 # ================================
-def retrieve_context(root_dir, query, top_k=8):
+def retrieve_context(root_dir, query, top_k=8, alpha=0.7):
+    """Hybrid dense + lexical retrieval"""
     docs = load_json(f"{INDEX_DIR}/docs.json")
+    if not docs:
+        raise ValueError("No indexed documents found. Run ensure_index() first.")
+
     index_path = f"{INDEX_DIR}/{Path(root_dir).stem}.faiss"
+    emb_cache_path = f"{INDEX_DIR}/embeddings.npy"
 
-    if not docs or not os.path.exists(index_path):
-        raise ValueError("❌ No FAISS index or docs found. Run ensure_index() first.")
+    if not os.path.exists(index_path) or not os.path.exists(emb_cache_path):
+        raise ValueError("Missing FAISS or embedding cache.")
 
-    emb = model.encode([query], normalize_embeddings=True, convert_to_numpy=True)
+    # Dense
+    emb = encode_texts([query])
     index = faiss.read_index(index_path)
-    _, idx = index.search(emb.astype('float32'), top_k)
-    return [docs[i]["text"][:1000] for i in idx[0] if i < len(docs)]
+    dense_scores, dense_idx = index.search(emb, top_k * 2)
+
+    # Lexical (BM25)
+    bm25_data = load_json(f"{INDEX_DIR}/bm25.json")
+    tokenized = [d["text"].split() for d in bm25_data["docs"]]
+    bm25 = BM25Okapi(tokenized)
+    query_tokens = query.replace("\n", " ").split()  # simple, same as indexing
+    bm25_scores = bm25.get_scores(query_tokens)
+
+    # Fusion
+    combined = {}
+    for i, doc_idx in enumerate(dense_idx[0]):
+        if doc_idx < len(docs):
+            max_bm25 = bm25_scores.max() if bm25_scores.max() > 0 else 1.0
+            combined[doc_idx] = alpha * dense_scores[0][i] + (1 - alpha) * (bm25_scores[doc_idx] / max_bm25)
+
+    top_results = sorted(combined.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    return [docs[i]["text"][:1000] for i, _ in top_results]
