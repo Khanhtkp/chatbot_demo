@@ -15,7 +15,7 @@ import re
 # Configuration
 # ================================
 INDEX_DIR = "storage"
-TEXT_EXTENSIONS = {".py", ".js", ".ts", ".java", ".cpp", ".cs", ".txt", ".md"}
+TEXT_EXTENSIONS = {".py", ".js", ".ts", ".java", ".cpp", ".cs", ".txt", ".md", ".ipynb", ".toml", ".yaml"}
 MODEL_NAME = "jinaai/jina-embeddings-v2-base-code"  # Code-aware embedding model
 
 # Load Jina model properly (no partial weights issue)
@@ -210,7 +210,9 @@ def retrieve_context(root_dir, query, top_k=8, alpha=0.7):
     bm25 = BM25Okapi(tokenized)
     query_tokens = query.replace("\n", " ").split()  # simple, same as indexing
     bm25_scores = bm25.get_scores(query_tokens)
-
+    logging.info(f"Dense scores: {dense_scores[0][:10]}")
+    logging.info(f"Dense idx: {dense_idx[0][:10]}")
+    logging.info(f"BM25 max: {bm25_scores.max()} | BM25 nonzero: {(bm25_scores > 0).sum()}")
     # Fusion
     combined = {}
     for i, doc_idx in enumerate(dense_idx[0]):

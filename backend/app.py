@@ -34,14 +34,14 @@ def chat(req: ChatRequest):
         with open(candidate_file, "r", encoding="utf-8") as f:
             code_text = f.read()
         retrieval_query = construct_retrieval_query(req.question, code_text)
-        logging.info(retrieval_query)
+        logging.info(f"Query: {retrieval_query}")
     else:
         logging.info("⚠️ No candidate file found.")
         retrieval_query = req.question
 
     # 🔸 Use the constructed retrieval query for context retrieval
     retrieved = retrieve_context(req.parent_root, retrieval_query, top_k=8)
-
+    logging.info(f"Documents retrieved: {retrieved}")
     # Ask the LLM with the *user question* + retrieved context
     answer = ask_llm(req.question, retrieved)
     return {"answer": answer, "context": retrieved}
@@ -49,7 +49,7 @@ def chat(req: ChatRequest):
 
 def find_recent_code_file(root_dir: str):
     """Pick the most recently modified code file in the workspace."""
-    exts = (".py", ".js", ".ts", ".cpp", ".java", ".cs")
+    exts = (".py", ".js", ".ts", ".cpp", ".java", ".cs", ".ipynb")
     latest = None
     latest_mtime = -1
     for dirpath, _, filenames in os.walk(root_dir):
