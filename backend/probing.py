@@ -35,5 +35,5 @@ def construct_retrieval_query(user_question: str, code_text: str, f: int = 10, m
     # Pick top-g chunks
     top_chunks = sorted(scores, key=lambda x: x[1], reverse=True)[:g]
     top_code = "\n".join([chunks[i] for i, _ in top_chunks])
-    retrieval_query = top_code + "\n" + target_chunk
+    retrieval_query = user_question.strip() + "\n\n" + top_code + "\n" + target_chunk
     return retrieval_query

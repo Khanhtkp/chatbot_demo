@@ -15,21 +15,30 @@ model = AutoModelForCausalLM.from_pretrained(
 
 def ask_llm(question, snippets):
     # Combine snippets as context
-    context = "\n\n---\n\n".join(snippets)
-    prompt = f"""You are a codebase assistant.
-Below are code snippets from the project. Use them to answer user questions accurately.
+    context = "\n\n".join(snippets)
+    
+    # Refined system prompt for code completion
+    system_prompt = """You are Qwen, an expert code assistant.
+- Only output code, no explanations or comments.
+- Do not repeat code already provided in context.
+- Only write the code necessary to fulfill the user's request.
+- Output in a format that can be directly inserted into the codebase.
+- Follow the coding style of the provided snippets.
+"""
+    
+    user_prompt = f"""Existing code snippets from the project:
 
 {context}
 
-Question: {question}
-Answer in detail:"""
-
-    # Construct the messages for Qwen chat template
+Task: {question}
+Only provide the code necessary to complete this task.
+Do NOT repeat any code already present in the snippets."""
+    
     messages = [
-        {"role": "system", "content": "You are Qwen, a helpful code assistant."},
-        {"role": "user", "content": prompt}
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
     ]
-
+    
     # Apply chat template
     text = tokenizer.apply_chat_template(
         messages,
@@ -43,7 +52,7 @@ Answer in detail:"""
     # Generate output
     generated_ids = model.generate(
         **model_inputs,
-        max_new_tokens=512
+        max_new_tokens=1024
     )
 
     # Remove input prompt from output

@@ -4,189 +4,99 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = require("vscode");
 const node_fetch_1 = require("node-fetch");
-// Store last indexed time per workspace to avoid unnecessary re-indexing
-const lastIndexed = {};
+function cleanGeneratedCode(code) {
+    // Remove ```python or ``` at the start/end of the code block
+    return code.replace(/^```(?:python)?\s*/, '').replace(/```$/, '').trim();
+}
 function activate(context) {
-    // File watcher to notify backend about new files
-    const watcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,js,py,java,cpp,cs,txt,ipynb}');
-    watcher.onDidCreate(async (uri) => {
-        console.log('🟢 New file detected:', uri.fsPath);
-        try {
-            const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
-            if (!workspaceFolder)
-                return;
-            await (0, node_fetch_1.default)('http://127.0.0.1:8000/index', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ parent_root: workspaceFolder.uri.fsPath }),
-            });
-            console.log('✅ Backend indexed new file');
-            // Update last indexed time
-            lastIndexed[workspaceFolder.uri.fsPath] = Date.now();
-        }
-        catch (err) {
-            console.error('❌ Indexing failed:', err);
-        }
-    });
-    context.subscriptions.push(watcher);
-    // Command to open CodeRAG Chat webview
-    const disposable = vscode.commands.registerCommand('coderag.chat', async () => {
-        const panel = vscode.window.createWebviewPanel('coderagChat', 'CodeRAG Chat', vscode.ViewColumn.Beside, { enableScripts: true });
-        panel.webview.html = getWebviewContent();
-        panel.webview.onDidReceiveMessage(async (msg) => {
-            console.log('📩 Received from WebView:', msg);
-            if (!msg.question)
-                return;
-            let parent = '';
+    const COMMENT_TRIGGER = /(?:#|\/\/)\s*generate\s+(.*)/i;
+    const processedLines = new Set();
+    const disposable = vscode.workspace.onDidChangeTextDocument(async (event) => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || editor.document !== event.document)
+            return;
+        for (const change of event.contentChanges) {
+            // Only trigger on Enter (new line)
+            if (!change.text.includes('\n'))
+                continue;
+            const lineIndex = change.range.start.line;
+            const lineText = editor.document.lineAt(lineIndex).text;
+            if (processedLines.has(lineText))
+                continue; // Skip if already processed
+            const match = lineText.match(COMMENT_TRIGGER);
+            if (!match)
+                continue;
+            const query = match[1].trim();
+            if (!query)
+                continue;
+            processedLines.add(lineText); // Mark line as processed
+            vscode.window.showInformationMessage(`💡 Generating code for: "${query}"`);
             try {
-                const active = vscode.window.activeTextEditor;
-                if (active && active.document && !active.document.isUntitled) {
-                    const workspaceFolder = vscode.workspace.getWorkspaceFolder(active.document.uri);
-                    parent = workspaceFolder?.uri.fsPath || '';
-                }
-                else if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-                    parent = vscode.workspace.workspaceFolders[0].uri.fsPath;
-                }
-                if (!parent) {
-                    panel.webview.postMessage({ id: msg.id, answer: '⚠️ No file or workspace detected.' });
-                    return;
-                }
-            }
-            catch (err) {
-                console.error('Editor detection failed:', err);
-                panel.webview.postMessage({ id: msg.id, answer: '⚠️ Could not detect active file or workspace.' });
-                return;
-            }
-            console.log('🟡 Sending to backend:', { question: msg.question, parent });
-            try {
-                const now = Date.now();
-                const last = lastIndexed[parent] || 0;
-                // Only re-index if more than 60 seconds passed
-                if (now - last > 60000) {
-                    panel.webview.postMessage({ id: msg.id, status: 'indexing' });
-                    await (0, node_fetch_1.default)('http://127.0.0.1:8000/index', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ parent_root: parent }),
-                    });
-                    lastIndexed[parent] = now;
-                }
-                // Tell webview we are now thinking
-                panel.webview.postMessage({ id: msg.id, status: 'thinking' });
+                const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+                const parent_root = workspaceFolder?.uri.fsPath || '';
                 const res = await (0, node_fetch_1.default)('http://127.0.0.1:8000/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question: msg.question, parent_root: parent }),
+                    body: JSON.stringify({ question: query, parent_root }),
                 });
                 if (!res.ok)
                     throw new Error(`Server returned ${res.status}: ${res.statusText}`);
-                const data = (await res.json());
-                console.log('✅ Server response JSON:', data);
-                panel.webview.postMessage({ id: msg.id, answer: data.answer });
+                const data = await res.json();
+                const generatedCode = cleanGeneratedCode(data.answer);
+                // Show webview preview
+                const panel = vscode.window.createWebviewPanel('coderagCodePreview', 'Generated Code Preview', vscode.ViewColumn.Beside, { enableScripts: true });
+                panel.webview.html = getCodeWebviewContent(generatedCode);
+                panel.webview.onDidReceiveMessage(async (msg) => {
+                    if (msg.command === 'accept') {
+                        await editor.edit(editBuilder => {
+                            editBuilder.insert(new vscode.Position(lineIndex + 1, 0), `${generatedCode}\n`);
+                        });
+                        panel.dispose();
+                        vscode.window.showInformationMessage('✅ Code inserted!');
+                    }
+                    else if (msg.command === 'reject') {
+                        panel.dispose();
+                        vscode.window.showInformationMessage('❌ Code generation rejected');
+                    }
+                });
             }
             catch (err) {
-                console.error('❌ Fetch failed:', err);
-                panel.webview.postMessage({ id: msg.id, answer: `❌ Error: ${err.message}` });
+                vscode.window.showErrorMessage(`❌ Code generation failed: ${err.message}`);
+                processedLines.delete(lineText); // Allow retry if failed
             }
-        });
+        }
     });
     context.subscriptions.push(disposable);
 }
 function deactivate() { }
-// --------------------
-// HTML + JS for CodeRAG Chat Webview
-// --------------------
-function getWebviewContent() {
+function getCodeWebviewContent(code) {
     return /*html*/ `
   <!DOCTYPE html>
   <html lang="en">
   <head>
     <meta charset="UTF-8">
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
-      body { font-family: "Segoe UI", sans-serif; padding: 15px; background-color: #1e1e1e; color: #d4d4d4; }
-      textarea { width: 100%; height: 80px; resize: vertical; font-family: monospace; border-radius: 8px; border: 1px solid #3c3c3c; background: #252526; color: #fff; padding: 8px; box-sizing: border-box; }
-      button { margin-top: 10px; padding: 8px 14px; border: none; border-radius: 5px; background-color: #007acc; color: white; cursor: pointer; }
-      button:hover { background-color: #005fa3; }
-      #ans { background: #252526; padding: 12px; border-radius: 6px; margin-top: 16px; font-size: 14px; line-height: 1.5; max-height: 65vh; overflow-y: auto; }
-      .message { margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid #3c3c3c; }
-      .user { color: #9cdcfe; margin-bottom: 6px; }
-      .assistant { border-left: 3px solid #007acc; padding-left: 10px; margin-top: 6px; }
-      pre code { display: block; padding: 10px; background: #1e1e1e; border-radius: 8px; overflow-x: auto; }
-      code { background: #333; color: #dcdcaa; padding: 3px 6px; border-radius: 4px; }
+      body { font-family: "Segoe UI", sans-serif; padding: 15px; background: #1e1e1e; color: #d4d4d4; }
+      pre { background: #252526; padding: 15px; border-radius: 8px; overflow-x: auto; max-height: 80vh; white-space: pre-wrap; }
+      button { margin: 10px 5px 0 0; padding: 8px 16px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
+      #accept { background: #007acc; color: white; }
+      #reject { background: #c33; color: white; }
+      button:hover { opacity: 0.9; }
     </style>
   </head>
   <body>
-    <h2>💬 CodeRAG Chat</h2>
-    <textarea id="q" placeholder="Ask something about your code..."></textarea>
-    <button id="ask">Ask</button>
-    <div id="ans"></div>
+    <h3>Generated Code Preview</h3>
+    <pre><code>${code.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code></pre>
+    <button id="accept">Accept</button>
+    <button id="reject">Reject</button>
 
     <script>
       const vscode = acquireVsCodeApi();
-      const ansBox = document.getElementById('ans');
-
-      document.getElementById('ask').addEventListener('click', () => {
-        const q = document.getElementById('q').value.trim();
-        if (!q) return;
-
-        const msgId = Date.now();
-        appendMessage(q, msgId);
-        vscode.postMessage({ question: q, id: msgId });
-        document.getElementById('q').value = "";
-      });
-
-      window.addEventListener('message', event => {
-        const { id, answer, status } = event.data;
-        const replyDiv = document.querySelector(\`#reply-\${id}\`);
-        if (!replyDiv) return;
-
-        if (status === 'indexing') {
-          replyDiv.innerHTML = '<em>Indexing new files...</em>';
-          return;
-        }
-
-        if (status === 'thinking') {
-          replyDiv.innerHTML = '<em>Thinking...</em>';
-          return;
-        }
-
-        if (answer) {
-          replyDiv.innerHTML = '';
-          typeWriterEffect(marked.parse(answer), replyDiv);
-        }
-      });
-
-      function appendMessage(question, id) {
-        const wrapper = document.createElement('div');
-        wrapper.className = 'message';
-        wrapper.innerHTML = \`
-          <div class='user'><strong>You:</strong> \${question}</div>
-          <div class='assistant'><strong>Assistant:</strong><br><em id='reply-\${id}'>Thinking...</em></div>
-        \`;
-        ansBox.appendChild(wrapper);
-        ansBox.scrollTop = ansBox.scrollHeight;
-      }
-
-      function typeWriterEffect(fullHTML, container) {
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = fullHTML;
-        const text = tempDiv.innerText;
-        container.innerHTML = "";
-        let i = 0;
-        function type() {
-          if (i < text.length) {
-            container.textContent += text.charAt(i);
-            i++;
-            setTimeout(type, 15);
-          } else {
-            container.innerHTML = fullHTML;
-          }
-        }
-        type();
-      }
+      document.getElementById('accept').addEventListener('click', () => vscode.postMessage({ command: 'accept' }));
+      document.getElementById('reject').addEventListener('click', () => vscode.postMessage({ command: 'reject' }));
     </script>
   </body>
-  </html>`;
+  </html>
+  `;
 }
 //# sourceMappingURL=extension.js.map
